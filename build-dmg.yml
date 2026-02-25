@@ -1,0 +1,160 @@
+name: Build macOS DMG
+
+# Triggers:
+#   - Every push to main (builds a test DMG as an artifact)
+#   - Every time you publish a GitHub Release (attaches DMG to the release)
+#   - Manual trigger from the Actions tab
+
+on:
+  push:
+    branches: [ main ]
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+jobs:
+  build-macos-dmg:
+    name: Build DMG on macOS
+    runs-on: macos-latest        # GitHub spins up a real Mac for this
+
+    steps:
+      # ── 1. Check out your code ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 3. Install Python dependencies ──────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 requests Pillow pyinstaller
+
+      # ── 4. Create app icon (generates a basic icon if none exists) ──────────
+      - name: Generate app icon
+        run: |
+          mkdir -p icon.iconset
+
+          python3 - <<'EOF'
+          from PIL import Image, ImageDraw, ImageFont
+          import os
+
+          sizes = [16, 32, 64, 128, 256, 512, 1024]
+
+          for size in sizes:
+              img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+              draw = ImageDraw.Draw(img)
+
+              # Background circle with gradient effect
+              margin = size // 10
+              draw.ellipse([margin, margin, size - margin, size - margin],
+                           fill=(99, 102, 241, 255))
+
+              # Inner lighter circle
+              inner_margin = size // 5
+              draw.ellipse([inner_margin, inner_margin,
+                            size - inner_margin, size - inner_margin],
+                           fill=(129, 140, 248, 255))
+
+              # Letter S in the center
+              font_size = size // 2
+              try:
+                  font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+              except:
+                  font = ImageFont.load_default()
+
+              text = "S"
+              bbox = draw.textbbox((0, 0), text, font=font)
+              text_w = bbox[2] - bbox[0]
+              text_h = bbox[3] - bbox[1]
+              x = (size - text_w) // 2
+              y = (size - text_h) // 2 - bbox[1]
+              draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
+
+              # Save at 1x size
+              img.save(f"icon.iconset/icon_{size}x{size}.png")
+
+              # Save at 2x size (retina) for sizes up to 512
+              if size <= 512:
+                  img_2x = img.resize((size * 2, size * 2), Image.LANCZOS)
+                  img_2x.save(f"icon.iconset/icon_{size}x{size}@2x.png")
+
+          print("Icon images generated successfully")
+          EOF
+
+          # Convert iconset to .icns using macOS tool
+          iconutil -c icns icon.iconset -o SocialSync.icns
+          echo "✓ SocialSync.icns created"
+
+      # ── 5. Build the .app bundle with PyInstaller ───────────────────────────
+      - name: Build .app with PyInstaller
+        run: |
+          pyinstaller \
+            --windowed \
+            --name "SocialSync" \
+            --icon "SocialSync.icns" \
+            --osx-bundle-identifier "com.socialsync.app" \
+            --add-data "README.md:." \
+            --add-data "docs/CREDENTIALS.md:docs" \
+            --hidden-import "PIL._tkinter_finder" \
+            --collect-all "PyQt6" \
+            --noconfirm \
+            --clean \
+            socialsync.py
+
+          echo "✓ .app bundle created"
+          ls -la dist/
+
+      # ── 6. Verify the .app was built correctly ──────────────────────────────
+      - name: Verify .app bundle
+        run: |
+          if [ ! -d "dist/SocialSync.app" ]; then
+            echo "❌ ERROR: SocialSync.app not found in dist/"
+            exit 1
+          fi
+          echo "✓ SocialSync.app exists"
+          echo "App bundle contents:"
+          ls dist/SocialSync.app/Contents/
+
+      # ── 7. Create the DMG ───────────────────────────────────────────────────
+      - name: Create DMG
+        run: |
+          # Create a temp folder to stage the DMG contents
+          mkdir -p dmg_staging
+          cp -r "dist/SocialSync.app" dmg_staging/
+
+          # Add a symlink to /Applications so users can drag-and-drop install
+          ln -s /Applications dmg_staging/Applications
+
+          # Create the DMG
+          hdiutil create \
+            -volname "SocialSync" \
+            -srcfolder dmg_staging \
+            -ov \
+            -format UDZO \
+            -fs HFS+ \
+            "SocialSync.dmg"
+
+          echo "✓ SocialSync.dmg created"
+          ls -lh SocialSync.dmg
+
+      # ── 8. Upload DMG as a build artifact (available for every push) ────────
+      - name: Upload DMG as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SocialSync-macOS-DMG
+          path: SocialSync.dmg
+          retention-days: 30
+
+      # ── 9. Attach DMG to GitHub Release (only runs on release publishes) ────
+      - name: Upload DMG to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SocialSync.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
